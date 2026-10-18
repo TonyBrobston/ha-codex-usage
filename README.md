@@ -105,3 +105,11 @@ The integration exposes an **Update interval** option for normal usage polling.
 ## Disclaimer
 
 Codex Usage is a community-maintained project and is not affiliated with or endorsed by OpenAI or Home Assistant.
+
+## TonyBrobston fork: authentication recovery
+
+This fork adds a single OAuth refresh and retry when usage authentication fails
+before JWT expiry. Existing entries, entities, calendars, and history are retained.
+See [recovery behavior and limits](docs/auth-recovery.md) and the
+[pinned deployment and rollback procedure](docs/deployment.md). Deployment must
+follow review; this repository does not deploy to Home Assistant automatically.

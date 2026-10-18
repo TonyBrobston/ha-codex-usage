@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -56,6 +57,8 @@ def _refresh_requires_reauth(status: int, response_body: str) -> bool:
         marker in body
         for marker in (
             "refresh_token_invalidated",
+            "refresh_token_expired",
+            "refresh_token_reused",
             "invalid_grant",
             "refresh token has been invalidated",
             "refresh token is invalid",
@@ -86,11 +89,13 @@ def _jwt_expired(token: str, skew_seconds: int = 120) -> bool:
     except Exception:
         return False
 
-    exp = payload.get("exp")
-    if not exp:
+    if not isinstance(payload, dict):
         return False
-
-    return int(exp) <= int(datetime.now(tz=UTC).timestamp()) + skew_seconds
+    exp = payload.get("exp")
+    try:
+        return int(exp) <= int(datetime.now(tz=UTC).timestamp()) + skew_seconds
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 class CodexUsageCoordinator(DataUpdateCoordinator[dict]):
@@ -100,6 +105,7 @@ class CodexUsageCoordinator(DataUpdateCoordinator[dict]):
         self.hass = hass
         self.entry = entry
         self._cfg = entry.data
+        self._auth_lock = asyncio.Lock()
         self._reset_credits_payload: dict | None = None
         self._reset_credits_last_fetch: datetime | None = None
 
@@ -114,6 +120,7 @@ class CodexUsageCoordinator(DataUpdateCoordinator[dict]):
             hass,
             logger=_LOGGER,
             name=DOMAIN,
+            config_entry=entry,
             update_interval=timedelta(seconds=scan_interval),
         )
 
@@ -148,16 +155,30 @@ class CodexUsageCoordinator(DataUpdateCoordinator[dict]):
                         raise ConfigEntryAuthFailed(
                             "Codex authentication expired or was revoked; sign in again"
                         )
-                    raise UpdateFailed(f"Token refresh failed: HTTP {resp.status} {raw}")
-                return json.loads(raw)
-        except ClientError as err:
-            raise UpdateFailed(f"Token refresh failed: {err}") from err
+                    raise UpdateFailed(f"Token refresh failed: HTTP {resp.status}")
+                data = json.loads(raw)
+                if (
+                    not isinstance(data, dict)
+                    or not isinstance(data.get("access_token"), str)
+                    or not data["access_token"].strip()
+                    or any(
+                        key in data and (not isinstance(data[key], str) or not data[key].strip())
+                        for key in ("refresh_token", "id_token")
+                    )
+                ):
+                    raise UpdateFailed("Token refresh returned invalid credentials")
+                return data
+        except (ClientError, TimeoutError, ValueError) as err:
+            raise UpdateFailed("Token refresh request failed") from err
 
     async def _async_maybe_refresh_embedded_tokens(
-        self, access_token: str, refresh_token: str, account_id: str | None
+        self, access_token: str, refresh_token: str, account_id: str | None, *, force: bool = False
     ) -> tuple[str, str | None]:
-        if not access_token or not refresh_token or not _jwt_expired(access_token):
+        if not force and not _jwt_expired(access_token):
             return access_token, account_id
+
+        if not refresh_token:
+            raise ConfigEntryAuthFailed("No refresh token is available; sign in again")
 
         refreshed = await self._async_refresh_token(
             refresh_token, self._cfg.get(CONF_REFRESH_URL, DEFAULT_REFRESH_URL)
@@ -178,14 +199,20 @@ class CodexUsageCoordinator(DataUpdateCoordinator[dict]):
 
         return new_access, new_account_id
 
-    async def _async_get_bearer(self) -> tuple[str, str | None]:
+    async def _async_get_bearer(self, rejected_token: str | None = None) -> tuple[str, str | None]:
+        # Re-read credentials under the lock so concurrent 401s use rotated tokens.
+        async with self._auth_lock:
+            self._cfg = self.entry.data
+            return await self._async_get_bearer_locked(rejected_token)
+
+    async def _async_get_bearer_locked(self, rejected_token: str | None) -> tuple[str, str | None]:
         access_token = (self._cfg.get(CONF_ACCESS_TOKEN) or "").strip()
         refresh_token = (self._cfg.get(CONF_REFRESH_TOKEN) or "").strip()
         account_id = (self._cfg.get(CONF_ACCOUNT_ID) or "").strip() or None
 
         if access_token:
             return await self._async_maybe_refresh_embedded_tokens(
-                access_token, refresh_token, account_id
+                access_token, refresh_token, account_id, force=rejected_token == access_token
             )
 
         codex_home = self._cfg.get(CONF_CODEX_HOME, DEFAULT_CODEX_HOME)
@@ -200,9 +227,9 @@ class CodexUsageCoordinator(DataUpdateCoordinator[dict]):
         if not token:
             raise UpdateFailed("auth.json does not contain tokens.access_token")
 
-        if _jwt_expired(token):
+        if _jwt_expired(token) or rejected_token == token:
             if not refresh:
-                raise UpdateFailed("Codex token expired and no refresh_token was found")
+                raise ConfigEntryAuthFailed("No refresh token is available; sign in again")
 
             refreshed = await self._async_refresh_token(
                 refresh, self._cfg.get(CONF_REFRESH_URL, DEFAULT_REFRESH_URL)
@@ -213,14 +240,16 @@ class CodexUsageCoordinator(DataUpdateCoordinator[dict]):
                 token = refreshed["access_token"]
             if refreshed.get("refresh_token"):
                 auth["tokens"]["refresh_token"] = refreshed["refresh_token"]
+            if refreshed.get("id_token"):
+                auth["tokens"]["id_token"] = refreshed["id_token"]
+                file_account_id = account_id_from_id_token(refreshed["id_token"]) or file_account_id
+                auth["tokens"]["account_id"] = file_account_id
             auth["last_refresh"] = datetime.now(tz=UTC).isoformat()
             await self._async_write_auth_json(auth_path, auth)
 
         return token, file_account_id or account_id
 
-    async def _async_fetch_reset_credits(
-        self, token: str, account_id: str | None
-    ) -> dict:
+    async def _async_fetch_reset_credits(self, token: str, account_id: str | None) -> dict:
         headers = {
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
@@ -235,21 +264,16 @@ class CodexUsageCoordinator(DataUpdateCoordinator[dict]):
         try:
             async with session.get(RESET_CREDITS_URL, headers=headers, timeout=30) as resp:
                 if resp.status >= 400:
-                    body = await resp.text()
-                    raise UpdateFailed(
-                        f"Codex banked-reset request failed: HTTP {resp.status} {body}"
-                    )
+                    raise UpdateFailed(f"Codex banked-reset request failed: HTTP {resp.status}")
                 payload = await resp.json()
-        except ClientError as err:
-            raise UpdateFailed(f"Banked-reset network error: {err}") from err
+        except (ClientError, TimeoutError, ValueError) as err:
+            raise UpdateFailed("Banked-reset request failed") from err
 
         if not isinstance(payload, dict):
             raise UpdateFailed("The banked-reset API returned an unexpected response")
         return payload
 
-    async def _async_get_reset_credits(
-        self, token: str, account_id: str | None
-    ) -> dict:
+    async def _async_get_reset_credits(self, token: str, account_id: str | None) -> dict:
         now = datetime.now(tz=UTC)
         cache_age = (
             (now - self._reset_credits_last_fetch).total_seconds()
@@ -288,49 +312,54 @@ class CodexUsageCoordinator(DataUpdateCoordinator[dict]):
             error = str(err)
 
         normalized["reset_credits_last_update"] = (
-            self._reset_credits_last_fetch.isoformat()
-            if self._reset_credits_last_fetch
-            else None
+            self._reset_credits_last_fetch.isoformat() if self._reset_credits_last_fetch else None
         )
         normalized["reset_credits_error"] = error
         return normalized
+
+    async def _async_fetch_usage(
+        self, backend_url: str, token: str, account_id: str | None, *, recovering: bool = False
+    ) -> tuple[dict, int]:
+        """Fetch usage, preserving the initial account-header fallback."""
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "codex-usage-ha-integration",
+        }
+        if recovering and account_id:
+            headers["ChatGPT-Account-Id"] = account_id
+        session = aiohttp_client.async_get_clientsession(self.hass)
+        try:
+            # An initial 401 may only mean the account header is required.
+            for attempt in range(2 if account_id and not recovering else 1):
+                async with session.get(backend_url, headers=headers, timeout=30) as resp:
+                    if resp.status == 401:
+                        if attempt == 0 and account_id and not recovering:
+                            headers["ChatGPT-Account-Id"] = account_id
+                            continue
+                        return {}, 401
+                    if resp.status >= 400:
+                        raise UpdateFailed(f"Codex usage request failed: HTTP {resp.status}")
+                    raw = await resp.json()
+                    if not isinstance(raw, dict):
+                        raise UpdateFailed("The usage API returned an unexpected response")
+                    return raw, resp.status
+        except (ClientError, TimeoutError, ValueError) as err:
+            raise UpdateFailed("Codex usage request failed") from err
+        raise UpdateFailed("Codex usage request failed")
 
     async def _async_update_data(self) -> dict:
         token, account_id = await self._async_get_bearer()
         backend_url = self._cfg.get(CONF_BACKEND_URL, DEFAULT_BACKEND_URL)
 
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "User-Agent": "codex-usage-ha-integration",
-        }
-
-        session = aiohttp_client.async_get_clientsession(self.hass)
-        try:
-            async with session.get(backend_url, headers=headers, timeout=30) as resp:
-                if resp.status == 401 and account_id:
-                    headers["ChatGPT-Account-Id"] = account_id
-                    async with session.get(backend_url, headers=headers, timeout=30) as retry:
-                        if retry.status >= 400:
-                            body = await retry.text()
-                            if retry.status == 401:
-                                raise ConfigEntryAuthFailed(
-                                    "Codex authentication is no longer valid; sign in again"
-                                )
-                            raise UpdateFailed(
-                                f"Codex usage request failed: HTTP {retry.status} {body}"
-                            )
-                        raw = await retry.json()
-                elif resp.status >= 400:
-                    body = await resp.text()
-                    if resp.status == 401:
-                        raise ConfigEntryAuthFailed(
-                            "Codex authentication is no longer valid; sign in again"
-                        )
-                    raise UpdateFailed(f"Codex usage request failed: HTTP {resp.status} {body}")
-                else:
-                    raw = await resp.json()
-        except ClientError as err:
-            raise UpdateFailed(f"Network error: {err}") from err
+        raw, status = await self._async_fetch_usage(backend_url, token, account_id)
+        if status == 401:
+            token, account_id = await self._async_get_bearer(rejected_token=token)
+            # Exactly one request after recovery; include the known account header.
+            raw, status = await self._async_fetch_usage(
+                backend_url, token, account_id, recovering=True
+            )
+        if status == 401:
+            raise ConfigEntryAuthFailed("Codex authentication is no longer valid; sign in again")
 
         rate = raw.get("rate_limit") or raw.get("rateLimits") or {}
         primary, secondary = classify_rate_limit_windows(rate)
