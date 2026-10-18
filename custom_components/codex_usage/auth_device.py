@@ -24,7 +24,8 @@ def _claims_from_jwt(jwt_token: str) -> dict:
     try:
         payload = jwt_token.split(".")[1]
         payload += "=" * (-len(payload) % 4)
-        return json.loads(base64.urlsafe_b64decode(payload.encode()).decode())
+        claims = json.loads(base64.urlsafe_b64decode(payload.encode()).decode())
+        return claims if isinstance(claims, dict) else {}
     except Exception:
         return {}
 
@@ -52,7 +53,7 @@ async def request_device_code(hass) -> dict:
         async with session.post(url, json=payload, timeout=30) as resp:
             body = await resp.text()
             if resp.status >= 400:
-                raise RuntimeError(f"Device code request failed: HTTP {resp.status} {body}")
+                raise RuntimeError(f"Device code request failed: HTTP {resp.status}")
             data = json.loads(body)
     except (ClientError, TimeoutError) as err:
         raise RuntimeError(f"Device code request failed: {err}") from err
@@ -81,7 +82,7 @@ async def poll_device_code_once(hass, device_auth_id: str, user_code: str) -> di
                 return None
             body = await resp.text()
             if resp.status >= 400:
-                raise RuntimeError(f"Device auth failed: HTTP {resp.status} {body}")
+                raise RuntimeError(f"Device auth failed: HTTP {resp.status}")
             return json.loads(body)
     except (ClientError, TimeoutError) as err:
         raise RuntimeError(f"Device auth failed: {err}") from err
@@ -131,7 +132,7 @@ async def exchange_code_for_tokens(hass, authorization_code: str, code_verifier:
         async with session.post(url, data=body, headers=headers, timeout=30) as resp:
             raw = await resp.text()
             if resp.status >= 400:
-                raise RuntimeError(f"Token exchange failed: HTTP {resp.status} {raw}")
+                raise RuntimeError(f"Token exchange failed: HTTP {resp.status}")
             data = json.loads(raw)
     except (ClientError, TimeoutError) as err:
         raise RuntimeError(f"Token exchange failed: {err}") from err
