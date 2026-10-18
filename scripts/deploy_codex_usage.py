@@ -8,7 +8,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO = "https://github.com/TonyBrobston/ha-codex-usage.git"
@@ -27,7 +27,9 @@ def replace_component(config: Path, source: Path) -> Path:
     backup_root.mkdir(mode=0o700, exist_ok=True)
     backup = (
         Path(
-            tempfile.mkdtemp(prefix=datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ-"), dir=backup_root)
+            tempfile.mkdtemp(
+                prefix=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-"), dir=backup_root
+            )
         )
         / "codex_usage"
     )
